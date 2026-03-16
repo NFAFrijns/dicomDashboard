@@ -3,49 +3,138 @@ import pydicom
 import pandas as pd
 import plotly.express as px
 from pathlib import Path
-import os
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
+import re
 
 
-def scan_dicom_folder(folder_path: str) -> list[dict]:
-    """Recursively scan folder for DICOM files and extract metadata."""
+def parse_dicom_date(date_str: str) -> datetime | None:
+    """Parse DICOM date format (YYYYMMDD) to datetime."""
+    if not date_str:
+        return None
+    try:
+        # DICOM date format is typically YYYYMMDD
+        date_str = str(date_str).strip()
+        if len(date_str) >= 8:
+            return datetime.strptime(date_str[:8], "%Y%m%d")
+    except Exception:
+        pass
+    return None
+
+
+def parse_age(age_str: str) -> int | None:
+    """Parse DICOM age string (e.g., '065Y') to integer years."""
+    if not age_str:
+        return None
+    try:
+        age_str = str(age_str).strip()
+        # Format is typically 065Y (3 digits + unit)
+        match = re.match(r"(\d+)([YMWD])?", age_str)
+        if match:
+            value = int(match.group(1))
+            unit = match.group(2) or "Y"
+            if unit == "Y":
+                return value
+            elif unit == "M":
+                return value // 12
+            elif unit == "W":
+                return value // 52
+            elif unit == "D":
+                return value // 365
+    except Exception:
+        pass
+    return None
+
+
+def scan_ct_folders(folder_path: str) -> list[dict]:
+    """
+    Scan folder structure for CT folders only.
+    Expected structure: Patient/Timepoint/CT_Patient_Timepoint/
+    Only reads FIRST slice for metadata (fast!).
+    """
     dicom_data = []
     folder = Path(folder_path)
 
     if not folder.exists():
         return []
 
-    # Find all .dcm files recursively
-    for dcm_file in folder.rglob("*.dcm"):
-        try:
-            ds = pydicom.dcmread(str(dcm_file), stop_before_pixels=True)
+    # Find all CT_ folders (skip MASK_ folders)
+    for ct_folder in folder.rglob("CT_*"):
+        if not ct_folder.is_dir():
+            continue
 
-            # Extract folder structure info (patient/year)
-            relative_path = dcm_file.relative_to(folder)
+        # Get all DICOM files in this CT folder
+        dcm_files = list(ct_folder.glob("*.dcm"))
+        if not dcm_files:
+            continue
+
+        # Sort to get consistent first slice
+        dcm_files.sort()
+        first_slice = dcm_files[0]
+
+        try:
+            ds = pydicom.dcmread(str(first_slice), stop_before_pixels=True)
+
+            # Extract folder structure: Patient/Timepoint/CT_...
+            relative_path = ct_folder.relative_to(folder)
             parts = relative_path.parts
 
+            # Parse patient and timepoint from folder structure
+            patient = parts[0] if len(parts) >= 1 else "unknown"
+            timepoint = parts[1] if len(parts) >= 2 else "unknown"
+
             record = {
-                "_file_path": str(dcm_file),
-                "_patient": parts[0] if len(parts) > 1 else "unknown",
-                "_timepoint": parts[1] if len(parts) > 2 else "unknown",
+                "Patient": patient,
+                "Timepoint": timepoint,
+                "Sex": getattr(ds, "PatientSex", None),
+                "Age": parse_age(getattr(ds, "PatientAge", None)),
+                "SliceThickness": float(ds.SliceThickness) if hasattr(ds, "SliceThickness") else None,
+                "SliceCount": len(dcm_files),
+                "Modality": getattr(ds, "Modality", None),
+                "StudyDate": parse_dicom_date(getattr(ds, "StudyDate", None)),
+                "_ct_folder": str(ct_folder),
             }
 
-            # Extract all metadata elements
-            for elem in ds:
-                if elem.VR != "SQ" and elem.keyword:  # Skip sequences and empty keywords
-                    try:
-                        value = elem.value
-                        # Convert to string for consistent handling
-                        if hasattr(value, "__iter__") and not isinstance(value, str):
-                            value = str(value)
-                        record[elem.keyword] = value
-                    except Exception:
-                        pass
-
             dicom_data.append(record)
+
         except Exception as e:
-            st.warning(f"Could not read {dcm_file}: {e}")
+            st.warning(f"Could not read {first_slice}: {e}")
 
     return dicom_data
+
+
+def calculate_time_between_scans(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculate time between 1YR and 5YR scans for each patient."""
+    time_data = []
+
+    patients = df["Patient"].unique()
+
+    for patient in patients:
+        patient_df = df[df["Patient"] == patient]
+
+        # Find 1YR and 5YR records
+        yr1 = patient_df[patient_df["Timepoint"] == "1YR"]
+        yr5 = patient_df[patient_df["Timepoint"] == "5YR"]
+
+        if len(yr1) > 0 and len(yr5) > 0:
+            date1 = yr1.iloc[0]["StudyDate"]
+            date5 = yr5.iloc[0]["StudyDate"]
+
+            if date1 and date5:
+                delta = relativedelta(date5, date1)
+                total_months = delta.years * 12 + delta.months
+
+                time_data.append({
+                    "Patient": patient,
+                    "1YR_Date": date1.strftime("%Y-%m-%d"),
+                    "5YR_Date": date5.strftime("%Y-%m-%d"),
+                    "Years": delta.years,
+                    "Months": delta.months,
+                    "Total_Months": total_months,
+                    "Time_Diff": f"{delta.years}y {delta.months}m",
+                })
+
+    return pd.DataFrame(time_data)
 
 
 def render_donut_chart(df: pd.DataFrame, field: str):
@@ -116,13 +205,13 @@ def render_stats_table(df: pd.DataFrame, field: str):
 
 def main():
     st.set_page_config(
-        page_title="DICOM Metadata Analyzer",
-        page_icon="🏥",
+        page_title="DICOM CT Metadata Dashboard",
+        page_icon="",
         layout="wide",
     )
 
-    st.title("DICOM Metadata Analyzer")
-    st.markdown("Analyze metadata from multiple DICOM files organized in patient/timepoint folders.")
+    st.title("DICOM CT Metadata Dashboard")
+    st.markdown("Fast metadata extraction from CT scans (reads only first slice per scan).")
 
     # Folder selection
     folder_path = st.text_input(
@@ -131,91 +220,127 @@ def main():
     )
 
     if not folder_path:
-        st.info("Please enter a folder path containing DICOM files organized as patient/timepoint subfolders.")
+        st.info("Expected folder structure: Patient/Timepoint/CT_Patient_Timepoint/")
         return
 
-    # Scan and load DICOM files
-    with st.spinner("Scanning for DICOM files..."):
-        dicom_data = scan_dicom_folder(folder_path)
+    # Scan CT folders only (fast - reads only first slice)
+    with st.spinner("Scanning CT folders..."):
+        dicom_data = scan_ct_folders(folder_path)
 
     if not dicom_data:
-        st.error("No DICOM files found in the specified folder.")
+        st.error("No CT folders found. Expected structure: Patient/Timepoint/CT_*/")
         return
 
-    # Convert to DataFrame
     df = pd.DataFrame(dicom_data)
+    st.success(f"Found {len(df)} CT scans across {df['Patient'].nunique()} patients")
 
-    st.success(f"Loaded {len(df)} DICOM files")
-
-    # Show folder structure summary
-    with st.expander("Folder structure summary"):
-        structure_df = df.groupby(["_patient", "_timepoint"]).size().reset_index(name="file_count")
-        st.dataframe(structure_df, use_container_width=True, hide_index=True)
-
-    # Get available metadata fields (exclude internal fields starting with _)
-    metadata_fields = [col for col in df.columns if not col.startswith("_")]
-
+    # ===================
+    # STANDARD METRICS
+    # ===================
     st.divider()
-    st.subheader("Available Metadata Fields")
-    st.write(f"Found {len(metadata_fields)} metadata fields across all files.")
+    st.header("Standard Metrics")
 
-    # Field selection
-    selected_fields = st.multiselect(
-        "Select fields to analyze:",
-        options=sorted(metadata_fields),
-        default=[],
-    )
+    col1, col2 = st.columns(2)
 
-    if not selected_fields:
-        st.info("Select one or more fields above to generate visualizations.")
+    with col1:
+        # Sex distribution
+        st.subheader("Sex")
+        if df["Sex"].notna().any():
+            render_count_table(df, "Sex")
+            render_donut_chart(df, "Sex")
+        else:
+            st.warning("No sex data available")
 
-        # Show all metadata fields as a reference
-        with st.expander("View all available fields"):
-            st.write(sorted(metadata_fields))
-        return
+        # Modality
+        st.subheader("Modality")
+        if df["Modality"].notna().any():
+            render_count_table(df, "Modality")
+        else:
+            st.warning("No modality data available")
 
+    with col2:
+        # Age statistics
+        st.subheader("Age (years)")
+        if df["Age"].notna().any():
+            render_stats_table(df, "Age")
+        else:
+            st.warning("No age data available")
+
+        # Slice Thickness
+        st.subheader("Slice Thickness (mm)")
+        if df["SliceThickness"].notna().any():
+            render_stats_table(df, "SliceThickness")
+        else:
+            st.warning("No slice thickness data available")
+
+        # Slice Count
+        st.subheader("Slice Count")
+        render_stats_table(df, "SliceCount")
+
+    # ===================
+    # TIME BETWEEN SCANS
+    # ===================
     st.divider()
-    st.subheader("Visualizations")
+    st.header("Time Between 1YR and 5YR CT Scans")
 
-    # For each selected field, let user choose visualization type
-    for field in selected_fields:
-        st.markdown(f"### {field}")
+    time_df = calculate_time_between_scans(df)
 
-        # Count unique values to suggest visualization type
-        unique_count = df[field].nunique()
-        non_null_count = df[field].notna().sum()
-
-        col1, col2 = st.columns([1, 3])
-
+    if len(time_df) > 0:
+        # Summary statistics
+        col1, col2, col3 = st.columns(3)
         with col1:
-            st.caption(f"Unique values: {unique_count}")
-            st.caption(f"Non-null: {non_null_count}/{len(df)}")
-
-            viz_type = st.radio(
-                f"Visualization for {field}:",
-                options=["Donut chart", "Table n (%)", "Table mean (SD)"],
-                key=f"viz_{field}",
-                label_visibility="collapsed",
-            )
-
+            st.metric("Patients with both scans", len(time_df))
         with col2:
-            if viz_type == "Donut chart":
-                render_donut_chart(df, field)
-            elif viz_type == "Table n (%)":
-                render_count_table(df, field)
-            else:
-                render_stats_table(df, field)
+            mean_months = time_df["Total_Months"].mean()
+            st.metric("Mean time difference", f"{mean_months / 12:.1f} years ({mean_months:.0f} months)")
+        with col3:
+            std_months = time_df["Total_Months"].std()
+            st.metric("SD", f"{std_months:.1f} months")
 
-        st.divider()
+        # Detailed table
+        st.subheader("Per-Patient Time Differences")
+        display_df = time_df[["Patient", "1YR_Date", "5YR_Date", "Time_Diff"]].copy()
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
 
-    # Option to export raw data
-    with st.expander("Export raw data"):
+        # Histogram of time differences
+        fig = px.histogram(
+            time_df,
+            x="Total_Months",
+            nbins=20,
+            title="Distribution of Time Between Scans (months)",
+            labels={"Total_Months": "Months between scans"},
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.warning("No patients found with both 1YR and 5YR scans")
+
+    # ===================
+    # RAW DATA
+    # ===================
+    st.divider()
+    st.header("Raw Data")
+
+    # Show summary table
+    display_cols = ["Patient", "Timepoint", "Sex", "Age", "SliceThickness", "SliceCount", "Modality"]
+    st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
+
+    # Export options
+    col1, col2 = st.columns(2)
+    with col1:
         st.download_button(
-            label="Download as CSV",
-            data=df.to_csv(index=False),
-            file_name="dicom_metadata.csv",
+            label="Download CT metadata as CSV",
+            data=df[display_cols].to_csv(index=False),
+            file_name="ct_metadata.csv",
             mime="text/csv",
         )
+    with col2:
+        if len(time_df) > 0:
+            st.download_button(
+                label="Download time differences as CSV",
+                data=time_df.to_csv(index=False),
+                file_name="time_between_scans.csv",
+                mime="text/csv",
+            )
 
 
 if __name__ == "__main__":
